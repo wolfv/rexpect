@@ -278,6 +278,11 @@ impl NBReader {
             None
         }
     }
+
+    pub fn read_all(&mut self) -> String {
+        let _ = self.read_into_buffer();
+        self.buffer.drain(..).collect()
+    }
 }
 
 #[cfg(test)]

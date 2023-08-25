@@ -9,6 +9,10 @@ use std::io::prelude::*;
 use std::io::LineWriter;
 use std::ops::{Deref, DerefMut};
 use std::process::Command;
+use nix::fcntl;
+use nix::libc::STDIN_FILENO;
+use nix::sys::termios;
+use nix::sys::termios::InputFlags;
 use tempfile;
 
 pub struct StreamSession<W: Write> {
@@ -88,6 +92,10 @@ impl<W: Write> StreamSession<W> {
         self.reader.try_read()
     }
 
+    pub fn read_all(&mut self) -> String {
+        self.reader.read_all()
+    }
+
     // wrapper around reader::read_until to give more context for errors
     fn exp(&mut self, needle: &ReadUntil) -> Result<(String, String), Error> {
         self.reader.read_until(needle)
@@ -148,6 +156,66 @@ impl<W: Write> StreamSession<W> {
     /// ```
     pub fn exp_any(&mut self, needles: Vec<ReadUntil>) -> Result<(String, String), Error> {
         self.exp(&ReadUntil::Any(needles))
+    }
+
+    pub fn interact(&mut self, escape_character: char) -> Result<(), Error> {
+        self.flush()?;
+        let original_mode = termios::tcgetattr(STDIN_FILENO)?;
+        let mut raw_mode = original_mode.clone();
+        raw_mode.input_flags.remove(
+            InputFlags::BRKINT | InputFlags::ICRNL | InputFlags::INPCK | InputFlags::ISTRIP | InputFlags::IXON);
+        raw_mode.output_flags.remove(termios::OutputFlags::OPOST);
+        raw_mode.control_flags.remove(termios::ControlFlags::CSIZE | termios::ControlFlags::PARENB);
+        raw_mode.control_flags.insert(termios::ControlFlags::CS8);
+        raw_mode.local_flags.remove(
+            termios::LocalFlags::ECHO | termios::LocalFlags::ICANON | termios::LocalFlags::IEXTEN | termios::LocalFlags::ISIG);
+        termios::tcsetattr(STDIN_FILENO, termios::SetArg::TCSAFLUSH, &raw_mode)?;
+
+        let flags = fcntl::fcntl(STDIN_FILENO, fcntl::FcntlArg::F_GETFL)?;
+        let new_flags = fcntl::OFlag::from_bits_truncate(flags) | fcntl::OFlag::O_NONBLOCK;
+        fcntl::fcntl(STDIN_FILENO, fcntl::FcntlArg::F_SETFL(new_flags))?;
+    
+        loop {
+            // std::io::stdout().write(b"h").unwrap();
+            std::io::stdout().flush().unwrap();
+            // first read from the process
+            std::io::stdout().write(self.read_all().as_bytes())?;
+            // println!("Reading from stdin");
+            let mut buf = [0u8; 1];
+            let n = std::io::stdin().read(&mut buf);
+            match n {
+                Ok(0) => {
+                    // EOF
+                    break;
+                }
+                Ok(_) => {
+                    // println!("Read: {:?}", buf[0]);
+                    std::io::stdout().write(&buf)?;
+                    self.writer.write(&buf)?;
+                    self.writer.flush()?;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Would block
+                    // println!("Would block, try again");
+                    continue;
+                }
+                Err(e) => {
+                    println!("An error occurred: {}", e);
+                    break;
+                }
+            }
+            // let n = std::io::stdin().read(&mut buf)?;
+            // println!("buf: {:?} == {}", buf, escape_character);
+            // if buf[0] == escape_character as u8 {
+            //     break;
+            // }
+            // std::io::stdout().write(&buf)?;
+            // std::io::stdout().flush()?;
+        }
+
+        termios::tcsetattr(STDIN_FILENO, termios::SetArg::TCSAFLUSH, &original_mode)?;
+
+        Ok(())
     }
 }
 /// Interact with a process with read/write/signals, etc.
