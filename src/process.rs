@@ -138,14 +138,11 @@ impl PtyProcess {
                 Err(Error::Nix(nix::Error::last()))
             }
             ForkResult::Parent { child: child_pid } => {
-                let mut pty_proc = PtyProcess {
+                Ok(PtyProcess {
                     pty: master_fd,
                     child_pid,
                     kill_timeout: None,
-                };
-                // let window_size = opts.window_size.unwrap_or((24, 80));
-                // pty_proc.set_window_size(window_size.0, window_size.1)?;
-                Ok(pty_proc)
+                })
             }
         }
     }

@@ -123,31 +123,31 @@ impl NBReader {
     pub fn new<R: Read + Send + 'static>(f: R, timeout: Option<u64>) -> NBReader {
         let (tx, rx) = channel();
 
-        // spawn a thread which reads one char and sends it to tx
-        thread::spawn(move || -> Result<(), Error> {
-            let mut reader = BufReader::new(f);
-            let mut byte = [0u8];
-            loop {
-                match reader.read(&mut byte) {
-                    Ok(0) => {
-                        tx.send(Ok(PipedChar::EOF))
-                            .map_err(|_| Error::MpscSendError)?;
-                        break;
-                    }
-                    Ok(_) => {
-                        tx.send(Ok(PipedChar::Char(byte[0])))
-                            .map_err(|_| Error::MpscSendError)?;
-                    }
-                    Err(error) => {
-                        tx.send(Err(PipeError::IO(error)))
-                            .map_err(|_| Error::MpscSendError)?;
-                    }
-                }
-            }
-            Ok(())
-            // don't do error handling as on an error it was most probably
-            // the main thread which exited (remote hangup)
-        });
+        // // spawn a thread which reads one char and sends it to tx
+        // thread::spawn(move || -> Result<(), Error> {
+        //     let mut reader = BufReader::new(f);
+        //     let mut byte = [0u8];
+        //     loop {
+        //         match reader.read(&mut byte) {
+        //             Ok(0) => {
+        //                 tx.send(Ok(PipedChar::EOF))
+        //                     .map_err(|_| Error::MpscSendError)?;
+        //                 break;
+        //             }
+        //             Ok(_) => {
+        //                 tx.send(Ok(PipedChar::Char(byte[0])))
+        //                     .map_err(|_| Error::MpscSendError)?;
+        //             }
+        //             Err(error) => {
+        //                 tx.send(Err(PipeError::IO(error)))
+        //                     .map_err(|_| Error::MpscSendError)?;
+        //             }
+        //         }
+        //     }
+        //     Ok(())
+        //     // don't do error handling as on an error it was most probably
+        //     // the main thread which exited (remote hangup)
+        // });
         // allocate string with a initial capacity of 1024, so when appending chars
         // we don't need to reallocate memory often
         NBReader {

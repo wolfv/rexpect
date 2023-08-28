@@ -5,22 +5,27 @@ use crate::process::PtyProcess;
 use crate::process::PtyProcessOptions;
 pub use crate::reader::ReadUntil;
 use crate::reader::{NBReader, Regex};
-use libc::winsize;
 use libc::SIGWINCH;
 use libc::STDOUT_FILENO;
 use libc::TIOCGWINSZ;
+use libc::winsize;
 use nix::fcntl;
 use nix::libc::STDIN_FILENO;
+use nix::sys::select::FdSet;
+use nix::sys::select::select;
 use nix::sys::termios;
+use nix::sys::time::TimeVal;
 use nix::sys::wait::WaitStatus;
-use signal_hook::iterator::Signals;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::LineWriter;
 use std::mem;
 use std::ops::{Deref, DerefMut};
+use std::os::fd::AsRawFd;
 use std::process::Command;
 use tempfile;
+use signal_hook::iterator::Signals;
+
 
 pub struct StreamSession<W: Write> {
     pub writer: LineWriter<W>,
@@ -260,12 +265,15 @@ impl PtySession {
     fn new(process: PtyProcess, timeout_ms: Option<u64>) -> Result<Self, Error> {
         let f = process.get_file_handle()?;
         let reader = f.try_clone()?;
+        println!("reader: {:?}", reader);
         let stream = StreamSession::new(reader, f, timeout_ms);
+        println!("stream done");
         Ok(Self { process, stream })
     }
 
     pub fn interact(&mut self, escape_character: char) -> Result<(), Error> {
-        self.flush()?;
+        // self.flush()?;
+        println!("interact");
 
         let original_mode = self.process.set_raw()?;
 
@@ -276,66 +284,142 @@ impl PtySession {
 
         // Create a new signal hook to listen for SIGWINCH
         let mut signals = Signals::new(&[SIGWINCH])?;
+        let mut read_set = FdSet::new();
+        read_set.insert(STDIN_FILENO);
+        read_set.insert(self.process.pty.as_raw_fd());
 
         while self.process.status() == Some(WaitStatus::StillAlive) {
+            // println!("Going ... ");
             // Process each signal as it comes in
-            for signal in signals.pending() {
-                match signal as libc::c_int {
-                    SIGWINCH => {
-                        // Query the terminal dimensions
-                        let mut size: winsize = unsafe { mem::zeroed() };
-                        let res = unsafe { libc::ioctl(STDOUT_FILENO, TIOCGWINSZ, &mut size) };
-                        if res == 0 {
-                            PtyProcess::set_window_size(size)?;
+            // for signal in signals.pending() {
+            //     match signal as libc::c_int {
+            //         SIGWINCH => {
+            //             // Query the terminal dimensions
+            //             let mut size: winsize = unsafe { mem::zeroed() };
+            //             let res = unsafe { libc::ioctl(STDOUT_FILENO, TIOCGWINSZ, &mut size) };
+            //             if res == 0 {
+            //                 PtyProcess::set_window_size(size)?;
+            //             }
+            //         },
+            //         _ => unreachable!(),
+            //     }
+            // }
+
+            let mut timeout = TimeVal::new(0, 200);
+            let mut select_set = read_set.clone();
+            let ready_fd_count = select(None, &mut select_set, None, None, &mut timeout);
+            // println!("ready_fd_count: {:?}", ready_fd_count);
+
+            if select_set.contains(STDIN_FILENO) {
+                // println!("XS");
+                let mut buf = [0u8; 1000];
+                let n = std::io::stdin().read(&mut buf);
+                match n {
+                    Ok(0) => {
+                        // EOF
+                        break;
+                    }
+                    Ok(read_until) => {
+                        self.stream.writer.write(&buf[..read_until])?;
+                        self.stream.writer.flush()?;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    Err(e) => {
+                        println!("An error occurred: {}", e);
+                        break;
+                    }
+                }
+                // println!("XX");
+            }
+
+            if select_set.contains(self.process.pty.as_raw_fd()) {
+                // first read from the process
+                // println!("RS");
+                let mut buf = [0u8; 1000];
+
+                let n = self.process.pty.read(&mut buf[..])?;
+                let mut start = 0;
+                // println!("Read {} bytes", n);
+                while start < n {
+                    let res = std::io::stdout().write(&buf[start..n]);
+                    match res {
+                        Ok(0) => {
+                            // EOF
+                            break;
+                        }
+                        Ok(w) => {
+                            start += w;
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // println!("Would block, try again");
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("An error occurred while writing to STDOUT: {}", e);
+                            break;
                         }
                     }
-                    _ => unreachable!(),
                 }
+                // std::io::stdout().write(&buf)?;
+                match std::io::stdout().flush() {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("An error occurred while flushing STDOUT: {}", e);
+                        break;
+                    }
+                }
+                // println!("DS");
             }
 
-            // first read from the process
-            match std::io::stdout().write(self.stream.read_all().as_bytes()) {
-                Ok(_) => {}
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(e) => {
-                    println!("An error occurred while writing to STDOUT: {}", e);
-                    break;
-                }
-            }
 
-            match std::io::stdout().flush() {
-                Ok(_) => {}
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(e) => {
-                    println!("An error occurred while flushing STDOUT: {}", e);
-                    break;
-                }
-            }
+            // // first read from the process
+            // match std::io::stdout().write(self.stream.read_all().as_bytes()) {
+            //     Ok(_) => {}
+            //     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            //         continue;
+            //     }
+            //     Err(e) => {
+            //         println!("An error occurred while writing to STDOUT: {}", e);
+            //         break;
+            //     }
+            // }
 
-            let mut buf = [0u8; 1000];
-            let n = std::io::stdin().read(&mut buf);
+            // match std::io::stdout().flush() {
+            //     Ok(_) => {}
+            //     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            //         continue;
+            //     }
+            //     Err(e) => {
+            //         println!("An error occurred while flushing STDOUT: {}", e);
+            //         break;
+            //     }
+            // }
 
-            match n {
-                Ok(0) => {
-                    // EOF
-                    break;
-                }
-                Ok(_) => {
-                    self.stream.writer.write(&buf)?;
-                    self.stream.writer.flush()?;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(e) => {
-                    println!("An error occurred while reading STDIN: {}", e);
-                    break;
-                }
-            }
+            // let mut buf = [0u8; 1000];
+            // let n = std::io::stdin().read(&mut buf);
+
+            // match n {
+            //     Ok(0) => {
+            //         // EOF
+            //         break;
+            //     }
+            //     Ok(_) => {
+            //         self.stream.writer.write(&buf)?;
+            //         self.stream.writer.flush()?;
+            //     }
+            //     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            //         continue;
+            //     }
+            //     Err(e) => {
+            //         println!("An error occurred while reading STDIN: {}", e);
+            //         break;
+            //     }
+            // }
         }
         self.process.reset_mode(original_mode)?;
         Ok(())
@@ -384,9 +468,6 @@ pub fn spawn_command(command: Command, timeout_ms: Option<u64>) -> Result<PtySes
     let mut size: winsize = unsafe { mem::zeroed() };
     // Query the terminal dimensions
     let res = unsafe { libc::ioctl(STDOUT_FILENO, TIOCGWINSZ, &mut size) };
-
-    println!("res: {}", res);
-    println!("size: {:?}", size);
 
     let mut process = PtyProcess::new(
         command,
@@ -502,18 +583,18 @@ impl Drop for PtyReplSession {
         // check status of child process
         // if it's still running, then send a SIGTERM
         if let Some(status) = self.process.status() {
-            match status {
-                WaitStatus::Exited(_, _) | WaitStatus::Stopped(_, _) => {}
-                WaitStatus::Signaled(_, _, _)
-                | WaitStatus::Continued(_)
-                | WaitStatus::StillAlive => {
-                    if let Some(ref cmd) = self.quit_command {
-                        self.pty_session
-                            .send_line(cmd)
-                            .expect(&format!("could not run `{}` on child process", cmd));
-                    }
-                }
-            }
+            // match status {
+            //     WaitStatus::Exited(_, _) | WaitStatus::Stopped(_, _) => {}
+            //     WaitStatus::Signaled(_, _, _)
+            //     | WaitStatus::Continued(_)
+            //     | WaitStatus::StillAlive => {
+            //         if let Some(ref cmd) = self.quit_command {
+            //             self.pty_session
+            //                 .send_line(cmd)
+            //                 .expect(&format!("could not run `{}` on child process", cmd));
+            //         }
+            //     }
+            // }
         }
     }
 }
@@ -570,11 +651,11 @@ pub fn spawn_bash(timeout: Option<u64>) -> Result<PtyReplSession, Error> {
             quit_command: Some("quit".to_string()),
             echo_on: false,
         };
-        pb.exp_string("~~~~")?;
-        rcfile.close()?;
-        pb.send_line(&("PS1='".to_string() + new_prompt + "'"))?;
+        // pb.exp_string("~~~~")?;
+        // rcfile.close()?;
+        // pb.send_line(&("PS1='".to_string() + new_prompt + "'"))?;
         // wait until the new prompt appears
-        pb.wait_for_prompt()?;
+        // pb.wait_for_prompt()?;
         Ok(pb)
     })
 }
