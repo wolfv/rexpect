@@ -5,17 +5,17 @@ use crate::process::PtyProcess;
 use crate::process::PtyProcessOptions;
 pub use crate::reader::ReadUntil;
 use crate::reader::{NBReader, Regex};
+use libc::winsize;
 use libc::SIGWINCH;
 use libc::STDOUT_FILENO;
 use libc::TIOCGWINSZ;
-use libc::winsize;
 use nix::fcntl;
 use nix::libc::STDIN_FILENO;
-use nix::sys::select::FdSet;
 use nix::sys::select::select;
-use nix::sys::termios;
+use nix::sys::select::FdSet;
 use nix::sys::time::TimeVal;
 use nix::sys::wait::WaitStatus;
+use signal_hook::iterator::Signals;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::LineWriter;
@@ -24,8 +24,6 @@ use std::ops::{Deref, DerefMut};
 use std::os::fd::AsRawFd;
 use std::process::Command;
 use tempfile;
-use signal_hook::iterator::Signals;
-
 
 pub struct StreamSession<W: Write> {
     pub writer: LineWriter<W>,
@@ -169,75 +167,6 @@ impl<W: Write> StreamSession<W> {
     pub fn exp_any(&mut self, needles: Vec<ReadUntil>) -> Result<(String, String), Error> {
         self.exp(&ReadUntil::Any(needles))
     }
-
-    // pub fn interact(&mut self, escape_character: char) -> Result<(), Error> {
-    //     self.flush()?;
-    //     // let original_mode = termios::tcgetattr(STDIN_FILENO)?;
-    //     // let mut raw_mode = original_mode.clone();
-    //     // raw_mode.input_flags.remove(
-    //     //     InputFlags::BRKINT | InputFlags::ICRNL | InputFlags::INPCK | InputFlags::ISTRIP | InputFlags::IXON);
-    //     // raw_mode.output_flags.remove(termios::OutputFlags::OPOST);
-    //     // raw_mode.control_flags.remove(termios::ControlFlags::CSIZE | termios::ControlFlags::PARENB);
-    //     // raw_mode.control_flags.insert(termios::ControlFlags::CS8);
-    //     // raw_mode.local_flags.remove(
-    //     //     termios::LocalFlags::ECHO | termios::LocalFlags::ICANON | termios::LocalFlags::IEXTEN | termios::LocalFlags::ISIG);
-
-    //     // raw_mode.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 1;
-    //     // raw_mode.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 0;
-
-    //     termios::tcsetattr(STDIN_FILENO, termios::SetArg::TCSAFLUSH, &raw_mode)?;
-
-    //     let flags = fcntl::fcntl(STDIN_FILENO, fcntl::FcntlArg::F_GETFL)?;
-    //     let new_flags = fcntl::OFlag::from_bits_truncate(flags) | fcntl::OFlag::O_NONBLOCK;
-    //     fcntl::fcntl(STDIN_FILENO, fcntl::FcntlArg::F_SETFL(new_flags))?;
-
-    //     // let mut fds = nix::FdSet::new().unwrap().insert(STDIN_FILENO);
-    //     // fds.insert(self.reader.reader.as_raw_fd());
-
-    //     loop {
-    //         std::io::stdout().flush().unwrap();
-    //         // first read from the process
-    //         std::io::stdout().write(self.read_all().as_bytes())?;
-    //         // println!("Reading from stdin");
-    //         let mut buf = [0u8; 1];
-    //         let n = std::io::stdin().read(&mut buf);
-    //         match n {
-    //             Ok(0) => {
-    //                 // EOF
-    //                 break;
-    //             }
-    //             Ok(_) => {
-    //                 // println!("Read: {:?}", buf[0]);
-    //                 // if buf[0] <= 26 {
-    //                 //     println!("Sending control char: {:?}", buf[0]);
-    //                 // }
-    //                 // std::io::stdout().write(&buf)?;
-    //                 self.writer.write(&buf)?;
-    //                 self.writer.flush()?;
-    //             }
-    //             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-    //                 // Would block
-    //                 // println!("Would block, try again");
-    //                 continue;
-    //             }
-    //             Err(e) => {
-    //                 println!("An error occurred: {}", e);
-    //                 break;
-    //             }
-    //         }
-    //         // let n = std::io::stdin().read(&mut buf)?;
-    //         // println!("buf: {:?} == {}", buf, escape_character);
-    //         // if buf[0] == escape_character as u8 {
-    //         //     break;
-    //         // }
-    //         // std::io::stdout().write(&buf)?;
-    //         // std::io::stdout().flush()?;
-    //     }
-
-    //     termios::tcsetattr(STDIN_FILENO, termios::SetArg::TCSAFLUSH, &original_mode)?;
-
-    //     Ok(())
-    // }
 }
 /// Interact with a process with read/write/signals, etc.
 #[allow(dead_code)]
@@ -289,26 +218,24 @@ impl PtySession {
         read_set.insert(self.process.pty.as_raw_fd());
 
         while self.process.status() == Some(WaitStatus::StillAlive) {
-            // println!("Going ... ");
             // Process each signal as it comes in
-            // for signal in signals.pending() {
-            //     match signal as libc::c_int {
-            //         SIGWINCH => {
-            //             // Query the terminal dimensions
-            //             let mut size: winsize = unsafe { mem::zeroed() };
-            //             let res = unsafe { libc::ioctl(STDOUT_FILENO, TIOCGWINSZ, &mut size) };
-            //             if res == 0 {
-            //                 PtyProcess::set_window_size(size)?;
-            //             }
-            //         },
-            //         _ => unreachable!(),
-            //     }
-            // }
+            for signal in signals.pending() {
+                match signal as libc::c_int {
+                    SIGWINCH => {
+                        // Query the terminal dimensions
+                        let mut size: winsize = unsafe { mem::zeroed() };
+                        let res = unsafe { libc::ioctl(STDOUT_FILENO, TIOCGWINSZ, &mut size) };
+                        if res == 0 {
+                            PtyProcess::set_window_size(self.process.pty.as_raw_fd(), size)?;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
 
-            let mut timeout = TimeVal::new(0, 200);
+            let mut timeout = TimeVal::new(4, 0);
             let mut select_set = read_set.clone();
             let ready_fd_count = select(None, &mut select_set, None, None, &mut timeout);
-            // println!("ready_fd_count: {:?}", ready_fd_count);
 
             if select_set.contains(STDIN_FILENO) {
                 // println!("XS");
@@ -335,13 +262,10 @@ impl PtySession {
             }
 
             if select_set.contains(self.process.pty.as_raw_fd()) {
-                // first read from the process
-                // println!("RS");
                 let mut buf = [0u8; 1000];
 
                 let n = self.process.pty.read(&mut buf[..])?;
                 let mut start = 0;
-                // println!("Read {} bytes", n);
                 while start < n {
                     let res = std::io::stdout().write(&buf[start..n]);
                     match res {
@@ -353,7 +277,6 @@ impl PtySession {
                             start += w;
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // println!("Would block, try again");
                             continue;
                         }
                         Err(e) => {
@@ -373,53 +296,7 @@ impl PtySession {
                         break;
                     }
                 }
-                // println!("DS");
             }
-
-
-            // // first read from the process
-            // match std::io::stdout().write(self.stream.read_all().as_bytes()) {
-            //     Ok(_) => {}
-            //     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            //         continue;
-            //     }
-            //     Err(e) => {
-            //         println!("An error occurred while writing to STDOUT: {}", e);
-            //         break;
-            //     }
-            // }
-
-            // match std::io::stdout().flush() {
-            //     Ok(_) => {}
-            //     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            //         continue;
-            //     }
-            //     Err(e) => {
-            //         println!("An error occurred while flushing STDOUT: {}", e);
-            //         break;
-            //     }
-            // }
-
-            // let mut buf = [0u8; 1000];
-            // let n = std::io::stdin().read(&mut buf);
-
-            // match n {
-            //     Ok(0) => {
-            //         // EOF
-            //         break;
-            //     }
-            //     Ok(_) => {
-            //         self.stream.writer.write(&buf)?;
-            //         self.stream.writer.flush()?;
-            //     }
-            //     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            //         continue;
-            //     }
-            //     Err(e) => {
-            //         println!("An error occurred while reading STDIN: {}", e);
-            //         break;
-            //     }
-            // }
         }
         self.process.reset_mode(original_mode)?;
         Ok(())

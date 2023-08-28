@@ -227,6 +227,7 @@ impl NBReader {
     /// ```
     ///
     pub fn read_until(&mut self, needle: &ReadUntil) -> Result<(String, String), Error> {
+        println!("read_until XXX");
         let start = time::Instant::now();
 
         loop {

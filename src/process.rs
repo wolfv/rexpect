@@ -127,23 +127,24 @@ impl PtyProcess {
 
                 PtyProcess::set_echo(opts.echo)?;
 
-                PtyProcess::set_window_size(opts.window_size.unwrap_or(Winsize {
-                    ws_row: 24,
-                    ws_col: 80,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                }))?;
+                PtyProcess::set_window_size(
+                    STDOUT_FILENO,
+                    opts.window_size.unwrap_or(Winsize {
+                        ws_row: 24,
+                        ws_col: 80,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    }),
+                )?;
 
                 command.exec();
                 Err(Error::Nix(nix::Error::last()))
             }
-            ForkResult::Parent { child: child_pid } => {
-                Ok(PtyProcess {
-                    pty: master_fd,
-                    child_pid,
-                    kill_timeout: None,
-                })
-            }
+            ForkResult::Parent { child: child_pid } => Ok(PtyProcess {
+                pty: master_fd,
+                child_pid,
+                kill_timeout: None,
+            }),
         }
     }
 
@@ -194,16 +195,8 @@ impl PtyProcess {
         Ok(())
     }
 
-    pub fn set_window_size(window_size: Winsize) -> Result<(), Error> {
-        unsafe { libc::ioctl(STDOUT_FILENO, nix::libc::TIOCSWINSZ, &window_size) };
-        Ok(())
-    }
-
-    pub fn interact(&mut self, c: char) -> Result<(), Error> {
-        let mut buf = [0u8; 1];
-        buf[0] = c as u8;
-        let _ = nix::unistd::write(STDOUT_FILENO, &buf);
-        let _ = nix::unistd::write(STDIN_FILENO, &buf);
+    pub fn set_window_size(raw_fd: i32, window_size: Winsize) -> Result<(), Error> {
+        unsafe { libc::ioctl(raw_fd, nix::libc::TIOCSWINSZ, &window_size) };
         Ok(())
     }
 
