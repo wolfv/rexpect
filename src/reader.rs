@@ -4,6 +4,7 @@ use crate::error::Error;
 pub use regex::Regex;
 use std::io::prelude::*;
 use std::io::{self, BufReader};
+use std::os::fd::AsRawFd;
 use std::sync::mpsc::{channel, Receiver};
 use std::{fmt, time};
 use std::{result, thread};

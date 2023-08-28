@@ -4,7 +4,10 @@ use crate::error::Error;
 use nix;
 use nix::fcntl::{open, OFlag};
 use nix::libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
+use nix::pty::Winsize;
 use nix::pty::{grantpt, posix_openpt, unlockpt, PtyMaster};
+use nix::sys::ioctl;
+use nix::sys::termios::{InputFlags, Termios};
 pub use nix::sys::{signal, wait};
 use nix::sys::{stat, termios};
 use nix::unistd::{close, dup, dup2, fork, setsid, ForkResult, Pid};
@@ -82,9 +85,14 @@ fn ptsname_r(fd: &PtyMaster) -> nix::Result<String> {
     }
 }
 
+pub struct PtyProcessOptions {
+    pub echo: bool,
+    pub window_size: Option<Winsize>,
+}
+
 impl PtyProcess {
     /// Start a process in a forked pty
-    pub fn new(mut command: Command) -> Result<Self, Error> {
+    pub fn new(mut command: Command, opts: &PtyProcessOptions) -> Result<Self, Error> {
         // Open a new PTY master
         let master_fd = posix_openpt(OFlag::O_RDWR)?;
 
@@ -117,20 +125,89 @@ impl PtyProcess {
                     close(slave_fd)?;
                 }
 
-                // set echo off
-                let mut flags = termios::tcgetattr(STDIN_FILENO)?;
-                flags.local_flags &= !termios::LocalFlags::ECHO;
-                termios::tcsetattr(STDIN_FILENO, termios::SetArg::TCSANOW, &flags)?;
+                PtyProcess::set_echo(opts.echo)?;
+
+                PtyProcess::set_window_size(opts.window_size.unwrap_or(Winsize {
+                    ws_row: 24,
+                    ws_col: 80,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                }))?;
 
                 command.exec();
                 Err(Error::Nix(nix::Error::last()))
             }
-            ForkResult::Parent { child: child_pid } => Ok(PtyProcess {
-                pty: master_fd,
-                child_pid,
-                kill_timeout: None,
-            }),
+            ForkResult::Parent { child: child_pid } => {
+                let mut pty_proc = PtyProcess {
+                    pty: master_fd,
+                    child_pid,
+                    kill_timeout: None,
+                };
+                // let window_size = opts.window_size.unwrap_or((24, 80));
+                // pty_proc.set_window_size(window_size.0, window_size.1)?;
+                Ok(pty_proc)
+            }
         }
+    }
+
+    /// Set raw mode on stdin and return the original mode
+    pub fn set_raw(&self) -> Result<Termios, Error> {
+        let original_mode = termios::tcgetattr(STDIN_FILENO)?;
+        let mut raw_mode = original_mode.clone();
+        raw_mode.input_flags.remove(
+            InputFlags::BRKINT
+                | InputFlags::ICRNL
+                | InputFlags::INPCK
+                | InputFlags::ISTRIP
+                | InputFlags::IXON,
+        );
+        raw_mode.output_flags.remove(termios::OutputFlags::OPOST);
+        raw_mode
+            .control_flags
+            .remove(termios::ControlFlags::CSIZE | termios::ControlFlags::PARENB);
+        raw_mode.control_flags.insert(termios::ControlFlags::CS8);
+        raw_mode.local_flags.remove(
+            termios::LocalFlags::ECHO
+                | termios::LocalFlags::ICANON
+                | termios::LocalFlags::IEXTEN
+                | termios::LocalFlags::ISIG,
+        );
+
+        raw_mode.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 1;
+        raw_mode.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 0;
+
+        termios::tcsetattr(STDIN_FILENO, termios::SetArg::TCSAFLUSH, &raw_mode)?;
+
+        Ok(original_mode)
+    }
+
+    pub fn reset_mode(&self, original_mode: Termios) -> Result<(), Error> {
+        termios::tcsetattr(STDIN_FILENO, termios::SetArg::TCSAFLUSH, &original_mode)?;
+        Ok(())
+    }
+
+    pub fn set_echo(echo: bool) -> Result<(), Error> {
+        let mut flags = termios::tcgetattr(STDIN_FILENO)?;
+        if echo {
+            flags.local_flags.insert(termios::LocalFlags::ECHO);
+        } else {
+            flags.local_flags.remove(termios::LocalFlags::ECHO);
+        }
+        termios::tcsetattr(STDIN_FILENO, termios::SetArg::TCSANOW, &flags)?;
+        Ok(())
+    }
+
+    pub fn set_window_size(window_size: Winsize) -> Result<(), Error> {
+        unsafe { libc::ioctl(STDOUT_FILENO, nix::libc::TIOCSWINSZ, &window_size) };
+        Ok(())
+    }
+
+    pub fn interact(&mut self, c: char) -> Result<(), Error> {
+        let mut buf = [0u8; 1];
+        buf[0] = c as u8;
+        let _ = nix::unistd::write(STDOUT_FILENO, &buf);
+        let _ = nix::unistd::write(STDIN_FILENO, &buf);
+        Ok(())
     }
 
     /// Get handle to pty fork for reading/writing
@@ -224,8 +301,6 @@ impl PtyProcess {
             }
         }
     }
-
-
 }
 
 impl Drop for PtyProcess {
